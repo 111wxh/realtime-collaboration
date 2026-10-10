@@ -16,13 +16,26 @@ export class ApiError extends Error {
 
   readonly status: number;
 
-  constructor(code: ErrorCode, message: string, status: number) {
+  /**
+   * true = 连接层面失败（服务没起 / 断网 / DNS 解析不了），不是服务端返回的业务错误。
+   * 调用方据此区分"该让用户改输入"还是"该让用户检查服务是否启动"。
+   */
+  readonly network: boolean;
+
+  constructor(code: ErrorCode, message: string, status: number, network = false) {
     super(message);
     this.name = 'ApiError';
     this.code = code;
     this.status = status;
+    this.network = network;
   }
 }
+
+/**
+ * 连接层面失败时的统一描述。fetch 在这种情况下只会抛 "Failed to fetch" / ECONNREFUSED，
+ * 对用户毫无信息量，所以在边界上换成一句能指导操作的话。
+ */
+export const NETWORK_ERROR_MESSAGE = '无法连接后端服务，请确认 API 已启动';
 
 interface AuthHooks {
   /** 取当前 access token（内存里的，可能为空） */
@@ -49,12 +62,23 @@ interface RequestOptions {
 async function parseError(response: Response): Promise<ApiError> {
   let code: ErrorCode = ERROR_CODES.INTERNAL;
   let message = `请求失败（HTTP ${response.status}）`;
+  let protocolError = false;
   try {
     const data = (await response.json()) as { code?: string; message?: string };
-    if (data && typeof data.code === 'string') code = data.code as ErrorCode;
+    if (data && typeof data.code === 'string') {
+      code = data.code as ErrorCode;
+      protocolError = true;
+    }
     if (data && typeof data.message === 'string') message = data.message;
   } catch {
     // 非 JSON 错误体：保持兜底文案
+  }
+
+  // 5xx 且响应体不是我们的协议错误形状 → 请求根本没到业务层，属于"后端不可达"。
+  // 典型案例：Next 的 rewrites 代理在后端没起时直接回 500 + 纯文本 "Internal Server Error"。
+  // 这种情况说"服务端出错了"会误导排查方向，换成连接描述。
+  if (!protocolError && response.status >= 500) {
+    return new ApiError(ERROR_CODES.INTERNAL, NETWORK_ERROR_MESSAGE, response.status, true);
   }
   return new ApiError(code, message, response.status);
 }
@@ -77,16 +101,43 @@ async function send(
   });
 }
 
+/** AbortError 是调用方主动取消，不该被当成"连不上后端" */
+function isAbortError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { name?: string }).name === 'AbortError'
+  );
+}
+
+/**
+ * 把连接层面的失败（fetch 抛错）翻译成带可读描述的 ApiError。
+ * 只有网络/连接失败会走到这里；服务端返回的 4xx/5xx 是正常 Response，不经过本函数。
+ */
+async function sendSafely(
+  path: string,
+  options: RequestOptions,
+  token: string | null,
+): Promise<Response> {
+  try {
+    return await send(path, options, token);
+  } catch (error) {
+    if (isAbortError(error) || error instanceof ApiError) throw error;
+    console.warn(`[api] 无法连接后端服务：${path}`, error);
+    throw new ApiError(ERROR_CODES.INTERNAL, NETWORK_ERROR_MESSAGE, 0, true);
+  }
+}
+
 /** 基础请求：处理错误体 → ApiError；204 → undefined */
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const token = options.auth === false ? null : (hooks?.getToken() ?? null);
-  let response = await send(path, options, token);
+  let response = await sendSafely(path, options, token);
 
   // 401：尝试一次 refresh 后重放（只重放一次，避免死循环）
   if (response.status === 401 && options.auth !== false && hooks) {
     const refreshed = await hooks.refresh();
     if (refreshed) {
-      response = await send(path, options, refreshed);
+      response = await sendSafely(path, options, refreshed);
     }
   }
 

@@ -53,7 +53,10 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       set({ status: 'authed', user, accessToken: token });
     } catch (error) {
       set({ status: 'anon', user: null, accessToken: null });
-      if (!(error instanceof ApiError) || error.status !== 401) {
+      if (error instanceof ApiError && error.network) {
+        // 后端不可达：把描述留在 store 里，登录页会显示（比静默跳转会清晰得多）
+        set({ error: { code: error.code, message: error.message } });
+      } else if (!(error instanceof ApiError) || error.status !== 401) {
         console.warn('[session] 恢复会话失败', error);
       }
     }
@@ -98,9 +101,13 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
             : { accessToken: result.accessToken },
         );
         return result.accessToken;
-      } catch {
-        // 刷新失败：refresh cookie 也失效了，把会话收敛成未登录（受保护路由会接管跳转）
+      } catch (error) {
+        // 刷新失败：refresh cookie 失效、或后端根本连不上，两种都收敛成未登录。
+        // 区别在描述：连不上时留一条可读提示（否则用户只看到被跳回登录页，不知为何）。
         set({ accessToken: null });
+        if (error instanceof ApiError && error.network) {
+          set({ error: { code: error.code, message: error.message } });
+        }
         if (get().status === 'authed') set({ status: 'anon', user: null });
         return null;
       } finally {

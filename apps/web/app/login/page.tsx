@@ -8,8 +8,7 @@
 import { useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
 
-import { ApiError } from '../../lib/api';
-import { errorMessage } from '../../lib/errorMessages';
+import { describeError } from '../../lib/errorMessages';
 import { useSessionStore } from '../../stores/session';
 import { ErrorBanner, Spinner } from '../../components/ui';
 
@@ -20,6 +19,10 @@ export default function LoginPage() {
   const status = useSessionStore((state) => state.status);
   const login = useSessionStore((state) => state.login);
   const register = useSessionStore((state) => state.register);
+  // 会话恢复（bootstrap）失败留下的描述：后端不可达时它会是"无法连接后端服务…"，
+  // 这样用户看到的就是原因，而不是莫名其妙被送回登录页。
+  const sessionError = useSessionStore((state) => state.error);
+  const clearSessionError = useSessionStore((state) => state.clearError);
 
   const [mode, setMode] = useState<Mode>('login');
   const [email, setEmail] = useState('');
@@ -45,12 +48,14 @@ export default function LoginPage() {
       }
       router.replace('/rooms');
     } catch (err) {
-      if (err instanceof ApiError) setError(errorMessage(err.code));
-      else setError('网络异常，请确认后端服务已启动');
+      setError(describeError(err));
     } finally {
       setBusy(false);
     }
   };
+
+  // 本地提交错误优先；没有则展示会话恢复留下的描述
+  const shownError = error || sessionError?.message || '';
 
   return (
     <main className="grid min-h-dvh place-items-center px-4 py-10">
@@ -124,7 +129,15 @@ export default function LoginPage() {
               />
             </label>
 
-            {error ? <ErrorBanner message={error} onDismiss={() => setError('')} /> : null}
+            {shownError ? (
+              <ErrorBanner
+                message={shownError}
+                onDismiss={() => {
+                  setError('');
+                  clearSessionError();
+                }}
+              />
+            ) : null}
 
             <button type="submit" className="ui-btn ui-btn-primary mt-1" disabled={busy}>
               {busy ? <Spinner className="text-white" /> : null}

@@ -182,4 +182,47 @@ describe('api', () => {
     expect(access.room.name).toBe('房间');
     expect(access.boardId).toBe('');
   });
+
+  it('连接失败（fetch 抛错）→ ApiError.network=true 且描述可读，不再透出 "Failed to fetch"', async () => {
+    vi.stubGlobal('fetch', async () => {
+      throw new TypeError('fetch failed');
+    });
+
+    await expect(api.refresh()).rejects.toMatchObject({
+      network: true,
+      status: 0,
+      message: expect.stringContaining('无法连接后端服务'),
+    });
+  });
+
+  it('调用方主动取消（AbortError）不被当成连接失败', async () => {
+    vi.stubGlobal('fetch', async () => {
+      const abort = new Error('aborted');
+      abort.name = 'AbortError';
+      throw abort;
+    });
+
+    await expect(api.listRooms()).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('代理在后端不可达时回的 500（纯文本体）→ 视为连接失败，而不是"服务端出错"', async () => {
+    // Next rewrites 代理的真实行为：后端没起时回 500 + "Internal Server Error"
+    vi.stubGlobal('fetch', async () => new Response('Internal Server Error', { status: 500 }));
+
+    await expect(api.refresh()).rejects.toMatchObject({
+      network: true,
+      status: 500,
+      message: expect.stringContaining('无法连接后端服务'),
+    });
+  });
+
+  it('带协议错误体的 5xx 仍是服务端错误（不算连接失败）', async () => {
+    mockFetch(() => ({ status: 500, body: { code: 'INTERNAL', message: '炸了' } }));
+
+    await expect(api.me()).rejects.toMatchObject({
+      network: false,
+      status: 500,
+      code: 'INTERNAL',
+    });
+  });
 });

@@ -22,3 +22,27 @@ export function errorMessage(code: string | undefined, fallback = '操作失败�
   if (!code) return fallback;
   return ERROR_MESSAGES[code as ErrorCode] ?? fallback;
 }
+
+/**
+ * 把一个异常翻译成给用户看的描述。与 errorMessage 的区别：
+ *  - 连接层面失败（后端没起 / 断网）走它自带的可读描述，而不是 INTERNAL 的"服务端出错"——
+ *    后者会把"服务根本连不上"说成"服务端出错了"，误导排查方向；
+ *  - 其它 ApiError 仍按 code 映射；非 ApiError 走兜底。
+ */
+export function describeError(error: unknown, fallback = '操作失败，请重试'): string {
+  if (isApiError(error)) {
+    return error.network ? error.message : errorMessage(error.code, fallback);
+  }
+  return fallback;
+}
+
+/** 结构判定而非 instanceof：避免本模块反向 import lib/api 造成循环依赖 */
+function isApiError(value: unknown): value is { code: string; message: string; network: boolean } {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { code?: unknown }).code === 'string' &&
+    typeof (value as { message?: unknown }).message === 'string' &&
+    typeof (value as { network?: unknown }).network === 'boolean'
+  );
+}
