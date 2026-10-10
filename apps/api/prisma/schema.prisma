@@ -1,0 +1,173 @@
+// 数据模型：计划书 §5.2 的 DDL 在 Prisma 侧的映射。
+//
+// 约定：
+//  - 表名/列名保持 snake_case（@map / @@map），与 §5.2 的 DDL 一一对应；
+//  - 主键用 gen_random_uuid()（PG 17 内置，无需 pgcrypto）；
+//  - shapes.id 由客户端生成（§5.4：乐观更新时本地就已有稳定 ID，重试天然幂等），
+//    所以没有数据库默认值；
+//  - 部分索引（idx_shapes_board_alive）Prisma schema 表达不了，写在
+//    migrations/*_init/migration.sql 里，见该文件中的说明。
+//
+// Prisma 版本说明：本机 registry 的 latest 是 8.0.0-rc，这里刻意固定在 6.19.3 ——
+// Prisma 7+ 改了配置方式（prisma.config.ts / 强制 driver adapter），第一版以稳定
+// 的 migrate/generate 工作流为准（见交付报告）。
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// 用户
+model User {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// citext：邮箱大小写不敏感唯一（重复注册由唯一约束 + 大小写归一共同保证）
+  email        String   @unique @db.Citext
+  passwordHash String   @map("password_hash")
+  displayName  String   @map("display_name")
+  avatarColor  String   @default("#4C8DFF") @map("avatar_color")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  ownedRooms    Room[]         @relation("RoomOwner")
+  memberships   RoomMember[]
+  createdShapes Shape[]
+  ops           ShapeOp[]
+  refreshTokens RefreshToken[]
+
+  @@map("users")
+}
+
+/// 房间
+model Room {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name       String
+  ownerId    String    @map("owner_id") @db.Uuid
+  /// 8 位短码，用于加入房间
+  inviteCode String    @unique @map("invite_code")
+  isPublic   Boolean   @default(false) @map("is_public")
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt  DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  owner   User         @relation("RoomOwner", fields: [ownerId], references: [id])
+  members RoomMember[]
+  boards  Board[]
+
+  @@map("rooms")
+}
+
+/// 成员（owner | member）
+model RoomMember {
+  roomId     String    @map("room_id") @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  role       String    @default("member")
+  joinedAt   DateTime  @default(now()) @map("joined_at") @db.Timestamptz(6)
+  lastSeenAt DateTime? @map("last_seen_at") @db.Timestamptz(6)
+
+  room Room @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([roomId, userId])
+  @@map("room_members")
+}
+
+/// 画布（第一版一房一板，预留给多画布）
+model Board {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  roomId    String   @map("room_id") @db.Uuid
+  name      String   @default("main")
+  /// 当前已提交的最大 seq：写操作在同一事务里锁定本行并 +1（§5.4 / §7.1）
+  lastSeq   BigInt   @default(0) @map("last_seq")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  room      Room            @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  shapes    Shape[]
+  ops       ShapeOp[]
+  snapshots BoardSnapshot[]
+
+  @@index([roomId])
+  @@map("boards")
+}
+
+/// 图形：shape_ops 的物化投影（唯一真相是 op log）
+model Shape {
+  id        String    @id @db.Uuid
+  boardId   String    @map("board_id") @db.Uuid
+  type      String
+  x         Float
+  y         Float
+  w         Float
+  h         Float
+  rotation  Float     @default(0)
+  zIndex    Int       @default(0) @map("z_index")
+  style     Json      @default("{}")
+  data      Json      @default("{}")
+  /// 乐观并发控制：创建为 1，每次成功 update +1
+  version   BigInt    @default(1)
+  createdBy String?   @map("created_by") @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime  @default(now()) @map("updated_at") @db.Timestamptz(6)
+  /// 软删除：断线补齐时能看到"删除"这个操作，而不是状态凭空消失
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  board   Board @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  creator User? @relation(fields: [createdBy], references: [id])
+
+  /// 常规索引；排除软删的部分索引在 migration.sql 里手工维护
+  @@index([boardId])
+  @@map("shapes")
+}
+
+/// 操作日志：append-only，一致性的核心
+model ShapeOp {
+  id         BigInt   @id @default(autoincrement())
+  boardId    String   @map("board_id") @db.Uuid
+  /// 每 board 单调递增，权威顺序
+  seq        BigInt
+  actorId    String?  @map("actor_id") @db.Uuid
+  /// create | update | delete | restore | reorder
+  opType     String   @map("op_type")
+  shapeId    String?  @map("shape_id") @db.Uuid
+  payload    Json
+  /// 幂等键：重复提交同一 clientOpId 无副作用
+  clientOpId String   @map("client_op_id") @db.Uuid
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  board Board @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  actor User? @relation(fields: [actorId], references: [id])
+
+  @@unique([boardId, seq])
+  @@unique([boardId, clientOpId])
+  @@index([boardId, seq])
+  @@map("shape_ops")
+}
+
+/// 快照：每 200 个 op 或每 60s 一次，只用于加速恢复
+model BoardSnapshot {
+  boardId   String   @id @map("board_id") @db.Uuid
+  seq       BigInt
+  state     Json
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  board Board @relation(fields: [boardId], references: [id], onDelete: Cascade)
+
+  @@map("board_snapshots")
+}
+
+/// 刷新令牌（只存哈希，可撤销）
+model RefreshToken {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}

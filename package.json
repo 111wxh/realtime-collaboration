@@ -1,0 +1,33 @@
+{
+  "name": "realtime-collaboration",
+  "version": "0.1.0",
+  "private": true,
+  "description": "实时协作白板 —— monorepo 根（产品线，见 docs/PLAN_v1.1.md）",
+  "packageManager": "pnpm@12.6.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm --filter @collab/shared build && pnpm -r --parallel --filter \"./apps/*\" dev",
+    "dev:shared": "pnpm --filter @collab/shared build:watch",
+    "lint": "prettier --check .",
+    "format": "prettier --write .",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "infra:up": "docker compose up -d postgres redis",
+    "infra:down": "docker compose down",
+    "infra:logs": "docker compose logs -f postgres redis",
+    "infra:ps": "docker compose ps",
+    "docker:up": "docker compose --profile full up -d --build",
+    "docker:down": "docker compose --profile full down",
+    "docker:build": "docker compose --profile full build",
+    "docker:logs": "docker compose --profile full logs -f",
+    "clean": "node -e \"['apps/web/.next','apps/web/out','apps/api/dist','packages/shared/dist'].forEach(p=>{try{require('fs').rmSync(p,{recursive:true,force:true})}catch(e){}})\""
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.0",
+    "prettier": "^3.9.9",
+    "typescript": "5.9.3"
+  }
+}

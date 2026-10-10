@@ -1,0 +1,156 @@
+# syntax=docker/dockerfile:1.7
+
+# ---------------------------------------------------------------------------
+# @collab/api 生产镜像（多阶段）
+#
+#   docker build -f infra/docker/Dockerfile.api -t collab-api .          # 独立构建
+#   docker compose --profile full build api                              # 通过 compose
+#
+# 同一镜像承担两个角色（计划书 §11.1）：
+#   api     —— CMD `node dist/main.js`，监听 3001，非 root 用户运行；
+#   migrate —— 一次性容器，命令 `prisma migrate deploy`（见 docker-compose.yml 的
+#              migrate 服务），跑完即退出，api 等它成功后再启动。
+#
+# 关键决策（每条都对应一个具体的坑）：
+#  1) 基础镜像用 node:24-bookworm-slim（glibc）而不是 alpine：
+#     argon2 是 native 依赖，官方预编译产物只有 prebuilds/linux-x64（glibc），
+#     没有 musl 版本 —— alpine 上 node-gyp-build 会退回源码编译，需要
+#     build-essential + python3，构建时间与镜像体积都更差。
+#  2) 额外装 openssl：Debian bookworm-slim 基础镜像里没有 libssl（已实测
+#     /lib/x86_64-linux-gnu 下无 libssl.so/libcrypto.so），而 Prisma 的
+#     schema/query engine 是动态链接 libssl 的 Rust 二进制，缺了它 migrate 与
+#     查询在运行期直接报错。ca-certificates 用于 HTTPS 出网。
+#  3) pnpm 版本与根 package.json 的 packageManager 字段对齐（pnpm@12.6.0）：
+#     用 npm 全局装，与 corepack 无关，行为可预期。
+#  4) 装依赖前必须 COPY pnpm-workspace.yaml：pnpm 12 把"原生包 install 脚本
+#     白名单"（allowBuilds）放在 workspace 配置里，缺了它 argon2 / @prisma/engines
+#     的构建脚本会被静默拦截，镜像能构建但运行期起不来。
+#  5) `--config.minimumReleaseAge=0`：pnpm 12 默认启用"最小发布年龄"供应链策略
+#     （默认 1440 分钟且 strict），会拒绝使用刚发布的版本。镜像内的确定性由
+#     --frozen-lockfile 保证，这里显式关掉年龄门禁，避免构建被上游发布时间误伤。
+#  6) 运行时不带 devDependencies：`pnpm deploy --prod` 产出**自包含**目录
+#     （dist + prisma/ + 生产 node_modules + 自带 lockfile，无 workspace 软链），
+#     只 COPY 结果，镜像里没有 tsc / vitest / @swc/core。
+#  7) prisma CLI 与 @prisma/client 的错位：迁移容器必须在同一镜像里能跑
+#     `prisma migrate deploy`，但 prisma CLI 通常是 devDependency，deploy --prod
+#     不会带它。这里按 workspace 里解析到的**同一版本号**单独装一份 CLI 到
+#     /opt/prisma-cli（自包含），运行时软链为 /usr/local/bin/prisma。
+#  8) 生成产物必须在 deploy 之后重新生成一次：工程的 prisma schema 用的是默认
+#     generator（无 output），客户端会写进 node_modules/.prisma/client —— 必须
+#     落在 deploy 目录自己的 node_modules 里，否则运行期报
+#     "@prisma/client did not initialize yet"。
+# ---------------------------------------------------------------------------
+
+ARG NODE_IMAGE=node:24-bookworm-slim
+# 可选：镜像构建用的 npm registry（内网/镜像源场景，如 https://registry.npmmirror.com）。
+# 留空 = 用默认 registry.npmjs.org。
+ARG NPM_REGISTRY=
+
+# ---------- base：所有阶段共用的 node + pnpm 环境 ----------
+FROM ${NODE_IMAGE} AS base
+
+# CI=1 让 pnpm/npm 非交互；这里不设 NODE_ENV=production —— deps 阶段必须装 devDeps 才能构建
+ENV PNPM_HOME=/pnpm \
+    PATH=/pnpm:$PATH \
+    PNPM_STORE_DIR=/pnpm/store \
+    CI=1
+
+ARG NPM_REGISTRY
+RUN set -eux; \
+    if [ -n "$NPM_REGISTRY" ]; then printf 'registry=%s\n' "$NPM_REGISTRY" >> /root/.npmrc; fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates openssl; \
+    rm -rf /var/lib/apt/lists/*; \
+    npm install -g pnpm@12.6.0; \
+    pnpm --version
+
+WORKDIR /app
+
+# ---------- deps：只拷清单，装全量依赖（构建 + prisma CLI 都需要 devDeps） ----------
+# 先从只含清单的最小上下文装依赖：源码改动不会使这一层缓存失效
+FROM base AS deps
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY apps/api/package.json apps/api/
+COPY apps/web/package.json apps/web/
+COPY packages/shared/package.json packages/shared/
+RUN --mount=type=cache,id=collab-pnpm-store,target=/pnpm/store \
+    pnpm install --frozen-lockfile --config.minimumReleaseAge=0
+
+# ---------- build：编译源码并产出交付目录 ----------
+FROM deps AS build
+COPY packages/shared packages/shared
+COPY apps/api apps/api
+
+# @collab/shared 必须先构建：它的 require 出口指向 dist/index.js，而 API 是 CommonJS 消费方
+RUN pnpm --filter @collab/shared build
+
+# Prisma 客户端生成：CLI 可能在 api 的 devDeps，也可能在 workspace 根（两种都探一遍）。
+# schema 还没入库时跳过，保证 M0 骨架阶段也能出镜像。
+RUN set -eux; \
+    if [ -x apps/api/node_modules/.bin/prisma ]; then \
+      pnpm --filter api exec prisma generate; \
+    elif [ -x node_modules/.bin/prisma ]; then \
+      pnpm exec prisma generate --schema apps/api/prisma/schema.prisma; \
+    else \
+      echo '[build] 未找到 prisma CLI，跳过 generate'; \
+    fi
+
+RUN pnpm --filter api build
+
+# 自包含生产目录（dist + prisma/ + 生产 node_modules，且带自己的 lockfile）
+RUN --mount=type=cache,id=collab-pnpm-store,target=/pnpm/store \
+    pnpm --filter api --prod deploy /deploy/api
+
+# migrate 容器要用的 prisma CLI：按 workspace 里的版本号单独装一份自包含 CLI
+RUN --mount=type=cache,id=collab-pnpm-store,target=/pnpm/store \
+    set -eux; \
+    mkdir -p /opt/prisma-cli; \
+    PRISMA_PKG=''; \
+    if [ -f apps/api/node_modules/prisma/package.json ]; then PRISMA_PKG=apps/api/node_modules/prisma; \
+    elif [ -f node_modules/prisma/package.json ]; then PRISMA_PKG=node_modules/prisma; fi; \
+    if [ -n "$PRISMA_PKG" ]; then \
+      PRISMA_VERSION="$(node -p "require('/app/${PRISMA_PKG}/package.json').version")"; \
+      printf 'packages:\n  - "."\nallowBuilds:\n  prisma: true\n  "@prisma/engines": true\n  "@prisma/client": true\n' > /opt/prisma-cli/pnpm-workspace.yaml; \
+      printf '{"name":"collab-prisma-cli","private":true,"version":"0.0.0"}\n' > /opt/prisma-cli/package.json; \
+      cd /opt/prisma-cli; \
+      pnpm add "prisma@${PRISMA_VERSION}" --config.minimumReleaseAge=0; \
+    else \
+      echo '[build] workspace 内没有 prisma，migrate 容器将不可用'; \
+    fi
+
+# 在 deploy 目录里重新生成客户端：默认 generator 写 node_modules/.prisma/client，
+# 必须与 deploy 自己的 node_modules 布局匹配
+RUN set -eux; \
+    if [ -f /deploy/api/prisma/schema.prisma ] && [ -x /opt/prisma-cli/node_modules/.bin/prisma ]; then \
+      cd /deploy/api; \
+      /opt/prisma-cli/node_modules/.bin/prisma generate --schema prisma/schema.prisma; \
+    fi
+
+# ---------- runtime：只保留运行期需要的东西 ----------
+# 刻意不复用 base：base 里有 pnpm 与 npm 缓存（约 150MB），运行期一点用不上。
+FROM ${NODE_IMAGE} AS runtime
+
+# Prisma 的 schema/query engine 是动态链接 libssl 的二进制，缺 openssl 会在运行期报错；
+# ca-certificates 供出网 HTTPS 用
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates openssl; \
+    rm -rf /var/lib/apt/lists/*
+
+ENV NODE_ENV=production \
+    PORT=3001
+
+COPY --from=build --chown=node:node /deploy/api /app
+COPY --from=build --chown=node:node /opt/prisma-cli /opt/prisma-cli
+# 同镜像跑迁移：`prisma migrate deploy` 免路径前缀（migrate 服务的 command）
+RUN ln -sf /opt/prisma-cli/node_modules/.bin/prisma /usr/local/bin/prisma
+
+WORKDIR /app
+USER node
+EXPOSE 3001
+
+# /health 是纯进程存活探针（apps/api/src/modules/health/health.controller.ts）
+HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=6 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3001)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "dist/main.js"]

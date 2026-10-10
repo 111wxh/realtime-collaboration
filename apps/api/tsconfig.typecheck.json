@@ -1,0 +1,12 @@
+{
+  // 类型检查专用配置：覆盖 src + 单测 + e2e。
+  // 与 tsconfig.json 的唯一差别是 module 走 ESNext —— e2e 里用了 top-level await
+  // （vitest 以 ESM 运行测试文件），CJS 的 module 设置会拒绝它。
+  // 构建产物仍由 tsconfig.build.json（CJS）决定，两者互不影响。
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler"
+  },
+  "include": ["src", "test", "vitest.config.ts", "vitest.e2e.config.ts"]
+}

@@ -1,0 +1,141 @@
+@import 'tailwindcss';
+
+/* Tailwind 4 设计令牌：把上面的 CSS 变量映射成 utility（bg-panel / border-line / text-muted …） */
+@theme {
+  --color-app: #f7f8fa;
+  --color-panel: #ffffff;
+  --color-ink: #16181d;
+  --color-muted: #5c6270;
+  --color-line: #e4e6eb;
+  --color-accent: #4c8dff;
+  --color-accent-soft: #eaf1ff;
+  --color-danger: #e5484d;
+  --color-danger-soft: #fdecec;
+  --color-ok: #12a594;
+}
+
+:root {
+  --bg: #f7f8fa;
+  --panel: #ffffff;
+  --ink: #16181d;
+  --muted: #5c6270;
+  --line: #e4e6eb;
+  --accent: #4c8dff;
+  --danger: #e5484d;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  padding: 0;
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    'PingFang SC',
+    'Microsoft YaHei',
+    sans-serif;
+}
+
+/* 画布页需要占满视口且不出现滚动条 */
+.board-shell {
+  height: 100dvh;
+  overflow: hidden;
+}
+
+/* ---------- 基础组件样式（纯 CSS，不用 @apply，避免层叠顺序踩坑） ---------- */
+
+.ui-input {
+  width: 100%;
+  height: 2.5rem;
+  padding: 0 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 0.875rem;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.ui-input:focus {
+  border-color: var(--accent);
+}
+
+.ui-input::placeholder {
+  color: #a3a8b4;
+}
+
+.ui-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  height: 2.5rem;
+  padding: 0 0.875rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    opacity 0.15s ease;
+}
+
+.ui-btn:hover:not(:disabled) {
+  background: #f2f4f8;
+}
+
+.ui-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.ui-btn-primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.ui-btn-primary:hover:not(:disabled) {
+  background: #3b7ef0;
+  border-color: #3b7ef0;
+}
+
+.ui-btn-danger {
+  border-color: var(--line);
+  color: var(--danger);
+}
+
+.ui-btn-danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
+
+.ui-btn-ghost {
+  border-color: transparent;
+  background: transparent;
+}
+
+.ui-card {
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  background: var(--panel);
+}
+
+/* 画布容器：禁止浏览器手势与文本选择，保证指针拖拽不被中断 */
+.canvas-surface {
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}

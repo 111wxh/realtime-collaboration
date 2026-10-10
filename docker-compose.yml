@@ -1,0 +1,147 @@
+# 两套运行方式（计划书 §11.3），同一份 compose 文件：
+#
+#   本地 dev（默认，不含 profile）：`docker compose up -d postgres redis`
+#     —— 只起 PostgreSQL + Redis，应用在宿主机 `pnpm dev` 跑（HMR / 断点 / 日志方便）。
+#        等价于 `pnpm infra:up`；该用法与端口映射必须保持不回归。
+#
+#   全栈交付（profile: full）：`docker compose --profile full up -d --build`
+#     —— 额外起 migrate（一次性）→ api → web，一键得到完整栈（G5：无需手工步骤）。
+#        等价于 `pnpm docker:up`。
+#
+# 宿主端口避让：PostgreSQL 对外用 5433（宿主 5432 常被本机已有服务占用），
+# 容器内仍是 5432 —— 宿主连接串只改端口号：postgresql://app:app@localhost:5433/collab
+# 容器内的 api / migrate 不走宿主端口，直接用服务名 + 容器端口：postgres:5432、redis:6379
+name: realtime-collaboration
+
+# 容器内 API 的公共环境变量（api 与 migrate 共用一份，避免两处漂移）
+x-api-env: &api-env
+  NODE_ENV: production
+  PORT: '3001'
+  # 注意：这里必须是服务名 postgres:5432，而不是 .env 里的 localhost:5433（那是宿主视角）
+  DATABASE_URL: postgresql://app:app@postgres:5432/collab
+  REDIS_URL: redis://redis:6379
+  # 浏览器来源（web 映射在宿主 3000）
+  CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+  JWT_SECRET: ${JWT_SECRET:-dev-only-change-me}
+  JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-15m}
+  REFRESH_TOKEN_TTL: ${REFRESH_TOKEN_TTL:-30d}
+  WS_MAX_BUFFER: ${WS_MAX_BUFFER:-1048576}
+  OPLOG_RETENTION_DAYS: ${OPLOG_RETENTION_DAYS:-7}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+# api 镜像只构建一次，migrate 复用同一镜像（计划书 §11.1：migrate = 同 api 镜像的一次性容器）
+x-api-build: &api-build
+  context: .
+  dockerfile: infra/docker/Dockerfile.api
+  args:
+    NPM_REGISTRY: ${NPM_REGISTRY:-}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: collab-postgres
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: collab
+    ports:
+      - '5433:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U app -d collab']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: collab-redis
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # 一次性迁移容器：跑完 `prisma migrate deploy` 即退出（restart: "no"）。
+  # 迁移只在这里执行一次，避免多实例并发迁移（计划书 §3.2）。
+  migrate:
+    profiles: ['full']
+    image: collab-api:local
+    build: *api-build
+    container_name: collab-migrate
+    command: ['prisma', 'migrate', 'deploy']
+    environment: *api-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+
+  api:
+    profiles: ['full']
+    image: collab-api:local
+    build: *api-build
+    container_name: collab-api
+    init: true
+    environment: *api-env
+    ports:
+      - '3001:3001'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # 迁移成功后才启动，保证 API 面对的表结构已就绪
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  web:
+    profiles: ['full']
+    image: collab-web:local
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.web
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
+        # 浏览器可见的地址：浏览器跑在宿主机上，所以是 localhost（构建期烘焙）
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-http://localhost:3001}
+        # 服务端 rewrites 的 REST 代理目标：容器网络内按服务名走
+        API_INTERNAL_URL: http://api:3001
+    container_name: collab-web
+    init: true
+    ports:
+      - '3000:3000'
+    environment:
+      NODE_ENV: production
+      PORT: '3000'
+      HOSTNAME: 0.0.0.0
+      # 运行期再传一遍：next.config.ts 的 rewrites 在服务端启动时求值
+      API_INTERNAL_URL: http://api:3001
+    depends_on:
+      # 真正的依赖发生在请求期（/api 反向代理）；启动顺序上只要求 api 先起
+      api:
+        condition: service_started
+    healthcheck:
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:

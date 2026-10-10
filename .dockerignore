@@ -1,0 +1,63 @@
+# Docker 构建上下文过滤：镜像里的一切都在容器内重新安装/构建，
+# 宿主机产物一律不进上下文（既省传输时间，也避免把本机 .env 密钥打进镜像）。
+#
+# 注意：Docker 的 .dockerignore 不做路径前缀推断，所以"任意层级"的目录
+# 都显式写成 `xxx` + `**/xxx` 两行，避免漏过滤。
+
+# 依赖（镜像内 pnpm install）
+node_modules
+**/node_modules
+.pnpm-store
+**/.pnpm-store
+
+# 构建产物（镜像内 tsc / next build 自己产）
+dist
+**/dist
+.next
+**/.next
+out
+**/out
+*.tsbuildinfo
+**/*.tsbuildinfo
+next-env.d.ts
+**/next-env.d.ts
+
+# Prisma 生成产物（镜像内 prisma generate 自己产）
+apps/api/prisma/generated
+
+# 环境变量：本地密钥不入镜像。容器需要的构建期变量由 compose 的 build.args 显式传入
+# （NEXT_PUBLIC_API_URL / NEXT_PUBLIC_WS_URL / API_INTERNAL_URL）。
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Git 元数据
+.git
+.gitignore
+.gitattributes
+
+# 测试 / 覆盖率 / 报告
+coverage
+**/coverage
+test-results
+**/test-results
+playwright-report
+**/playwright-report
+k6-summary.json
+**/k6-summary.json
+
+# 日志与缓存
+*.log
+**/*.log
+.turbo
+**/.turbo
+.cache
+**/.cache
+
+# 编辑器 / 系统
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+*.swp

@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  // *.fixtures.ts 只给单测用；生成的 prisma client 也不重复编译
+  "exclude": ["**/*.test.ts", "**/*.spec.ts", "**/*.fixtures.ts", "test", "dist"]
+}

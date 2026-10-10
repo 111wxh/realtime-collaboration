@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "strict": true,
+    "strictPropertyInitialization": false,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "sourceMap": true,
+    "declaration": false,
+    "noEmit": true,
+    "types": ["node"]
+  },
+  // 构建/运行用 CJS（Nest 运行在 CommonJS 下）；测试与 e2e 的类型检查走 tsconfig.typecheck.json
+  "include": ["src"]
+}

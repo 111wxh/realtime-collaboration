@@ -1,0 +1,101 @@
+# syntax=docker/dockerfile:1.7
+
+# ---------------------------------------------------------------------------
+# @collab/web 生产镜像（多阶段，Next.js standalone 输出）
+#
+#   docker build -f infra/docker/Dockerfile.web -t collab-web .           # 独立构建
+#   docker compose --profile full build web                               # 通过 compose
+#
+# 关键决策：
+#  1) 基础镜像 node:24-bookworm-slim：与 API 镜像同族，standalone 运行期只需要 node。
+#  2) `output: 'standalone'`（apps/web/next.config.ts）产出自带最小 server 与
+#     被追踪依赖的 .next/standalone。monorepo 下产物保留了 workspace 相对路径：
+#        apps/web/.next/standalone/apps/web/server.js   ← 入口
+#        apps/web/.next/standalone/node_modules         ← 追踪到的依赖
+#     静态资源不会被自动带上，必须手动拷到 app 目录下：
+#        .next/static → <standalone>/apps/web/.next/static
+#        public       → <standalone>/apps/web/public
+#  3) 浏览器可见的 NEXT_PUBLIC_* 是**构建期烘焙**的：默认按"浏览器在宿主机"给
+#     http://localhost:3001，compose 可用 build.args 覆盖。
+#     API_INTERNAL_URL 是服务端 rewrites 的 REST 代理目标（容器内 = http://api:3001），
+#     构建期与运行期都传一遍，规避不同 Next 版本对 rewrites 取值时机的差异。
+#  4) 构建期不 COPY .env.local（.dockerignore 排除 .env*）：本地开发变量不该进镜像，
+#     容器所需变量由 build args / compose environment 显式提供。
+#  5) 装依赖同样需要 COPY pnpm-workspace.yaml（allowBuilds）与
+#     --config.minimumReleaseAge=0，原因见 Dockerfile.api 顶部注释。
+#  6) 运行期非 root（node 用户），且不带 pnpm / 源码 / devDeps（standalone 已自包含）。
+# ---------------------------------------------------------------------------
+
+ARG NODE_IMAGE=node:24-bookworm-slim
+# 可选：镜像构建用的 npm registry（内网/镜像源场景），留空 = registry.npmjs.org
+ARG NPM_REGISTRY=
+
+# ---------- base：node + pnpm ----------
+FROM ${NODE_IMAGE} AS base
+
+ENV PNPM_HOME=/pnpm \
+    PATH=/pnpm:$PATH \
+    PNPM_STORE_DIR=/pnpm/store \
+    CI=1 \
+    NEXT_TELEMETRY_DISABLED=1
+
+ARG NPM_REGISTRY
+RUN set -eux; \
+    if [ -n "$NPM_REGISTRY" ]; then printf 'registry=%s\n' "$NPM_REGISTRY" >> /root/.npmrc; fi; \
+    npm install -g pnpm@12.6.0; \
+    pnpm --version
+
+WORKDIR /app
+
+# ---------- deps：只拷清单装依赖 ----------
+FROM base AS deps
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY apps/api/package.json apps/api/
+COPY apps/web/package.json apps/web/
+COPY packages/shared/package.json packages/shared/
+RUN --mount=type=cache,id=collab-pnpm-store,target=/pnpm/store \
+    pnpm install --frozen-lockfile --config.minimumReleaseAge=0
+
+# ---------- build：next build ----------
+FROM deps AS build
+
+# 构建期变量（NEXT_PUBLIC_* 会被打进浏览器包；浏览器运行在宿主机，因此默认 localhost）
+ARG NEXT_PUBLIC_API_URL=http://localhost:3001
+ARG NEXT_PUBLIC_WS_URL=http://localhost:3001
+ARG API_INTERNAL_URL=http://api:3001
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL} \
+    NEXT_PUBLIC_WS_URL=${NEXT_PUBLIC_WS_URL} \
+    API_INTERNAL_URL=${API_INTERNAL_URL}
+
+COPY packages/shared packages/shared
+COPY apps/web apps/web
+
+# web 通过 transpilePackages 直接编译 shared 的 src，但 shared 的 require 出口指向 dist，
+# 服务端若有 require 消费就必须先有 dist —— 先构建一次，成本极低
+RUN pnpm --filter @collab/shared build
+# public/ 可能还不存在，COPY 源缺失会直接失败：先兜一个空目录
+RUN mkdir -p apps/web/public
+RUN pnpm --filter web build
+
+# ---------- runtime：standalone + 静态资源 ----------
+# 刻意不复用 base：base 里的 pnpm 运行期用不上，standalone 只需要 node（约省 150MB）
+FROM ${NODE_IMAGE} AS runtime
+
+ENV NODE_ENV=production \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+
+# standalone 根 = /app，入口在 /app/apps/web/server.js（monorepo 路径被保留）
+COPY --from=build --chown=node:node /app/apps/web/.next/standalone ./
+COPY --from=build --chown=node:node /app/apps/web/.next/static ./apps/web/.next/static
+COPY --from=build --chown=node:node /app/apps/web/public ./apps/web/public
+
+WORKDIR /app
+USER node
+EXPOSE 3000
+
+# 首页由 Next 提供；用 <500 判活，避免把"首页渲染出 4xx"误判成容器挂了
+HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=6 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "apps/web/server.js"]
